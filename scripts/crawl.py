@@ -1,10 +1,10 @@
 # -*- coding: utf-8 -*-
-"""按书名首拼抓取 transchinese 三站 TXT 到本仓库。
-- 只抓 .txt（不抓 epub）
-- 跳过已存在且非空的文件，便于断点续传
-- 分批 git commit/push，避免单次提交过大
+"""按书名首拼抓取 transchinese 三站 TXT 到本仓库（只抓 txt，不抓 epub）
+- 跳过已存在且非空的文件，断点续传
+- 直链 404 时回退：解析详情页取出真实 .txt 链接补漏
+- 分批 git commit/push
 """
-import os, re, sys, time, json, subprocess, urllib.request, urllib.parse
+import os, re, sys, time, subprocess, urllib.request, urllib.parse
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pypinyin import lazy_pinyin, Style
 
@@ -36,7 +36,6 @@ def unquote_segs(path):
 
 def initial_of(title):
     s = title.strip()
-    # 反复剥离开头的符号/序号，直到露出汉字或字母
     for _ in range(8):
         s = re.sub(r"^[^0-9A-Za-z\u4e00-\u9fff]+", "", s)
         s = re.sub(r"^[0-9\s._\-]+", "", s)
@@ -57,6 +56,21 @@ def sanitize(name, maxlen=110):
     name = re.sub(r'[\\/:*?"<>|\r\n\t]', "_", name)
     name = re.sub(r"\s+", " ", name).strip().strip(".")
     return name[:maxlen] or "_"
+
+
+def resolve_from_page(page_url):
+    """详情页里找真实的 .txt 链接"""
+    try:
+        st, body = http_get(page_url, timeout=120)
+        if st != 200:
+            return None
+        html = body.decode("utf-8", "ignore")
+        links = re.findall(r'href="([^"]+\.txt)"', html)
+        if not links:
+            return None
+        return urllib.parse.urljoin(page_url, links[0])
+    except Exception:
+        return None
 
 
 def git(*args):
@@ -87,22 +101,20 @@ def main():
         print("未设置 LETTER"); sys.exit(1)
     print(f"===== 抓取首拼 [{LETTER}] =====", flush=True)
 
-    # 汇总书目
     books = []
     for base in SITES:
         host = urllib.parse.urlparse(base).netloc
+        pages = []
         for attempt in range(3):
             try:
                 st, body = http_get(base + "/sitemap.xml", timeout=240)
-                xml = body.decode("utf-8", "ignore")
-                locs = re.findall(r"<loc>\s*([^<\s]+)\s*</loc>", xml)
+                locs = re.findall(r"<loc>\s*([^<\s]+)\s*</loc>", body.decode("utf-8", "ignore"))
                 pages = [l for l in locs if l.endswith("_page/")]
-                print(f"  {host}: 详情页 {len(pages)}", flush=True)
                 break
             except Exception as e:
                 print(f"  {host} sitemap 失败({attempt+1}): {type(e).__name__}", flush=True)
                 time.sleep(5)
-                pages = []
+        print(f"  {host}: 详情页 {len(pages)}", flush=True)
         for p in pages:
             txt = p[:-6] + ".txt"
             segs = unquote_segs(urllib.parse.urlparse(txt).path)
@@ -111,24 +123,23 @@ def main():
             cat, name = segs[0], segs[-1]
             if not name.lower().endswith(".txt"):
                 continue
-            books.append((host, cat, name[:-4], txt))
+            books.append((host, cat, name[:-4], txt, p))
 
     mine = [b for b in books if initial_of(b[2]) == LETTER]
     print(f"本仓库应入库 {len(mine)} 本（全站 {len(books)} 本）", flush=True)
 
-    todo = []
-    skip_exist = 0
-    for host, cat, title, url in mine:
+    todo, skip_exist = [], 0
+    for host, cat, title, txt_url, page_url in mine:
         rel = os.path.join(SITE_DIR.get(host, host.split(".")[0]), sanitize(cat), sanitize(title) + ".txt")
         full = os.path.join(".", rel)
         if os.path.exists(full) and os.path.getsize(full) >= MIN_BYTES:
             skip_exist += 1
             continue
-        todo.append((rel, url))
-    print(f"已存在跳过 {skip_exist} 本，待下载 {len(todo)} 本", flush=True)
+        todo.append((rel, txt_url, page_url))
+    print(f"已存在跳过 {skip_exist} 本，待处理 {len(todo)} 本", flush=True)
 
     def work(item):
-        rel, url = item
+        rel, url, page = item
         full = os.path.join(".", rel)
         for attempt in range(3):
             try:
@@ -140,31 +151,45 @@ def main():
                         f.write(data)
                     os.replace(tmp, full)
                     return ("ok", rel, len(data))
-                if attempt == 2:
-                    return ("bad", rel, st)
-            except Exception as e:
-                if attempt == 2:
-                    return ("err", rel, f"{type(e).__name__}:{str(e)[:60]}")
+            except Exception:
+                pass
             time.sleep(2 * (attempt + 1))
-        return ("err", rel, "unknown")
+        # 回退：从详情页解析真实链接
+        real = resolve_from_page(page)
+        if real:
+            try:
+                st2, data2 = http_get(real, timeout=240)
+                if st2 == 200 and MIN_BYTES <= len(data2) <= MAX_BYTES:
+                    os.makedirs(os.path.dirname(full), exist_ok=True)
+                    tmp = full + ".part"
+                    with open(tmp, "wb") as f:
+                        f.write(data2)
+                    os.replace(tmp, full)
+                    return ("fixed", rel, len(data2))
+            except Exception:
+                pass
+        return ("fail", rel, url)
 
-    ok = n = 0
+    ok = fixed = n = 0
     total_bytes = 0
     t0 = time.time()
     with ThreadPoolExecutor(max_workers=WORKERS) as ex:
         futs = [ex.submit(work, t) for t in todo]
         for fu in as_completed(futs):
             kind, rel, info = fu.result()
-            if kind == "ok":
-                ok += 1
+            if kind in ("ok", "fixed"):
+                if kind == "ok":
+                    ok += 1
+                else:
+                    fixed += 1
                 total_bytes += info
             n += 1
             if n % COMMIT_EVERY == 0:
                 commit_batch(f"chore: 同步小说 {n}/{len(todo)} 本")
-                print(f"  进度 {n}/{len(todo)}，已入库 {ok} 本，{total_bytes/1048576:.0f} MB", flush=True)
+                print(f"  进度 {n}/{len(todo)}，已入库 {ok+fixed} 本，{total_bytes/1048576:.0f} MB", flush=True)
 
-    commit_batch(f"chore: 同步首拼 {LETTER} 小说（本次 {ok} 本）")
-    print(f"\n完成：本次入库 {ok} 本 / 待下载 {len(todo)} 本，共 {total_bytes/1048576:.1f} MB，用时 {(time.time()-t0)/60:.1f} 分钟", flush=True)
+    commit_batch(f"chore: 同步首拼 {LETTER} 小说（直链 {ok} 本 + 补漏 {fixed} 本）")
+    print(f"\n完成：直链入库 {ok} 本，详情页补漏 {fixed} 本，共 {total_bytes/1048576:.1f} MB，用时 {(time.time()-t0)/60:.1f} 分钟", flush=True)
 
 
 if __name__ == "__main__":
