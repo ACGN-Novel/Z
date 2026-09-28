@@ -1,0 +1,33 @@
+name: Crawl Z
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: '17 3 * * 0'
+
+permissions:
+  contents: write
+
+concurrency:
+  group: crawl-Z
+  cancel-in-progress: false
+
+jobs:
+  crawl:
+    runs-on: ubuntu-latest
+    timeout-minutes: 330
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - run: pip install pypinyin
+      - name: Crawl novels
+        env:
+          LETTER: "Z"
+          SITES: "https://novel.transchinese.org,https://xnovel.transchinese.org,https://unovel.transchinese.org"
+          WORKERS: "8"
+          COMMIT_EVERY: "150"
+        run: python3 scripts/crawl.py
