@@ -1,9 +1,9 @@
 # -*- coding: utf-8 -*-
-"""按书名首拼抓取 transchinese 三站 TXT（只抓 txt，不抓 epub）
-- 首拼采用「词组上下文注音」消歧多音字（重生=chong→C，长安=chang→C）
-- 自动迁移：把因首拼变化而放错仓库的书删除，由对应字母仓库重新收录
-- 跳过已存在且非空的文件，断点续传；直链 404 时回退详情页解析真实链接
-"""
+# 按书名首拼抓取 transchinese 三站 TXT（只抓 txt，不抓 epub）
+# - 首拼采用词组上下文注音消歧多音字（重生=chong->C，长安=chang->C）
+# - 书名规范化：去掉书名前的数字序号，保留书名号《》
+# - 自动迁移：书名首拼不再属于本仓库的书删除，由对应字母仓库重新收录
+# - 抓取完成后生成索引 README.md
 import os, re, sys, time, subprocess, urllib.request, urllib.parse
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pypinyin import lazy_pinyin, Style
@@ -47,12 +47,33 @@ def initial_of(title):
     ch = s[0]
     if "\u4e00" <= ch <= "\u9fff":
         m = re.match(r"^[\u4e00-\u9fff]+", s)
-        ctx = (m.group() if m else ch)[:8]   # 用词组上下文消歧多音字
+        ctx = (m.group() if m else ch)[:8]
         py = lazy_pinyin(ctx, style=Style.FIRST_LETTER)
         return (py[0].upper() if py and py[0] else "#")
     if ch.isalpha():
         return ch.upper()
     return "#"
+
+
+def clean_title(title):
+    # 去掉书名前的数字序号（含括号序号），保留书名号《》
+    s = title.strip()
+    prev = None
+    while prev != s and s:
+        prev = s
+        s2 = re.sub(r"^\d+[\s._\-\u00b7\u3001]*", "", s)
+        if s2 != s:
+            s = s2.strip()
+            continue
+        m = re.match(r"^(《)\s*\d+[\s._\-\u00b7\u3001]*", s)
+        if m:
+            s = s[:1] + s[m.end():]
+            continue
+        m = re.match(r"^([\(\[\uff08\u3010])\s*\d+\s*([\)\]\uff09\u3011])[\s._\-\u00b7\u3001]*", s)
+        if m:
+            s = s[m.end():]
+            continue
+    return s.strip() or title.strip()
 
 
 def sanitize(name, maxlen=110):
@@ -97,31 +118,73 @@ def commit_batch(note):
     return False
 
 
-def migrate_out():
-    """把首拼不再属于本仓库的书移除"""
-    removed = 0
+def walk_txt():
     for root, dirs, files in os.walk("."):
         dirs[:] = [d for d in dirs if d not in SKIP_DIRS and not d.startswith(".")]
         for fn in files:
-            if not fn.lower().endswith(".txt"):
-                continue
-            full = os.path.join(root, fn)
-            if initial_of(fn[:-4]) != LETTER:
-                git("rm", "-q", "--", full)
-                removed += 1
-    if removed:
-        commit_batch(f"chore: 迁移首拼变化的书目（移出 {removed} 本）")
-    return removed
+            if fn.lower().endswith(".txt"):
+                yield os.path.join(root, fn)
+
+
+def reconcile():
+    # 1) 首拼不属于本仓库的书删除（由对应仓库重新收录）
+    # 2) 书名带序号的本仓库内改名（保留书名号），冲突时保留原名
+    removed = renamed = 0
+    for full in list(walk_txt()):
+        fn = os.path.basename(full)
+        title = fn[:-4]
+        ct = clean_title(title)
+        if initial_of(ct) != LETTER:
+            git("rm", "-q", "--", full)
+            removed += 1
+            continue
+        if ct == title:
+            continue
+        target = os.path.join(os.path.dirname(full), sanitize(ct) + ".txt")
+        if os.path.exists(target):
+            continue
+        os.rename(full, target)
+        renamed += 1
+    if removed or renamed:
+        commit_batch("chore: 整理书目（移出 %d 本，去序号改名 %d 本）" % (removed, renamed))
+    return removed, renamed
+
+
+def build_readme():
+    entries = sorted(p.replace(os.sep, "/") for p in walk_txt())
+    by_dir = {}
+    for rel in entries:
+        d = rel.rsplit("/", 1)[0]
+        by_dir.setdefault(d, []).append(rel)
+    lines = ["# %s 仓库索引" % LETTER, ""]
+    lines.append("共收录 **%d** 本小说（txt 格式），按书名首拼 %s 归类。" % (len(entries), LETTER))
+    lines.append("")
+    lines.append("总索引见 [ACGN-Novel/U](https://github.com/ACGN-Novel/U)。")
+    lines.append("")
+    lines.append("| 站点/目录 | 数量 |")
+    lines.append("| --- | --- |")
+    for d in sorted(by_dir):
+        lines.append("| %s | %d |" % (d, len(by_dir[d])))
+    lines.append("")
+    for d in sorted(by_dir):
+        lines.append("## %s" % d)
+        lines.append("")
+        for rel in by_dir[d]:
+            name = rel.rsplit("/", 1)[1][:-4]
+            lines.append("- [%s](%s)" % (name, urllib.parse.quote(rel)))
+        lines.append("")
+    with open("README.md", "w", encoding="utf-8") as f:
+        f.write("\n".join(lines))
+    return len(entries)
 
 
 def main():
     if not LETTER:
         print("未设置 LETTER"); sys.exit(1)
-    print(f"===== 抓取首拼 [{LETTER}] =====", flush=True)
+    print("===== 抓取首拼 [%s] =====" % LETTER, flush=True)
 
-    removed = migrate_out()
-    if removed:
-        print(f"已移出首拼不属于 [{LETTER}] 的书 {removed} 本", flush=True)
+    removed, renamed = reconcile()
+    print("已移出 %d 本，去序号改名 %d 本" % (removed, renamed), flush=True)
 
     books = []
     for base in SITES:
@@ -134,9 +197,9 @@ def main():
                 pages = [l for l in locs if l.endswith("_page/")]
                 break
             except Exception as e:
-                print(f"  {host} sitemap 失败({attempt+1}): {type(e).__name__}", flush=True)
+                print("  %s sitemap 失败(%d): %s" % (host, attempt + 1, type(e).__name__), flush=True)
                 time.sleep(5)
-        print(f"  {host}: 详情页 {len(pages)}", flush=True)
+        print("  %s: 详情页 %d" % (host, len(pages)), flush=True)
         for p in pages:
             txt = p[:-6] + ".txt"
             segs = unquote_segs(urllib.parse.urlparse(txt).path)
@@ -147,18 +210,19 @@ def main():
                 continue
             books.append((host, cat, name[:-4], txt, p))
 
-    mine = [b for b in books if initial_of(b[2]) == LETTER]
-    print(f"本仓库应入库 {len(mine)} 本（全站 {len(books)} 本）", flush=True)
+    mine = [b for b in books if initial_of(clean_title(b[2])) == LETTER]
+    print("本仓库应入库 %d 本（全站 %d 本）" % (len(mine), len(books)), flush=True)
 
     todo, skip_exist = [], 0
     for host, cat, title, txt_url, page_url in mine:
-        rel = os.path.join(SITE_DIR.get(host, host.split(".")[0]), sanitize(cat), sanitize(title) + ".txt")
+        ct = clean_title(title)
+        rel = os.path.join(SITE_DIR.get(host, host.split(".")[0]), sanitize(cat), sanitize(ct) + ".txt")
         full = os.path.join(".", rel)
         if os.path.exists(full) and os.path.getsize(full) >= MIN_BYTES:
             skip_exist += 1
             continue
         todo.append((rel, txt_url, page_url))
-    print(f"已存在跳过 {skip_exist} 本，待处理 {len(todo)} 本", flush=True)
+    print("已存在跳过 %d 本，待处理 %d 本" % (skip_exist, len(todo)), flush=True)
 
     def work(item):
         rel, url, page = item
@@ -206,11 +270,15 @@ def main():
                 total_bytes += info
             n += 1
             if n % COMMIT_EVERY == 0:
-                commit_batch(f"chore: 同步小说 {n}/{len(todo)} 本")
-                print(f"  进度 {n}/{len(todo)}，已入库 {ok+fixed} 本，{total_bytes/1048576:.0f} MB", flush=True)
+                commit_batch("chore: 同步小说 %d/%d 本" % (n, len(todo)))
+                print("  进度 %d/%d，已入库 %d 本，%.0f MB" % (n, len(todo), ok + fixed, total_bytes / 1048576), flush=True)
 
-    commit_batch(f"chore: 同步首拼 {LETTER} 小说（直链 {ok} 本 + 补漏 {fixed} 本）")
-    print(f"\n完成：移出 {removed} 本，直链入库 {ok} 本，补漏 {fixed} 本，共 {total_bytes/1048576:.1f} MB，用时 {(time.time()-t0)/60:.1f} 分钟", flush=True)
+    commit_batch("chore: 同步首拼 %s 小说（直链 %d 本 + 补漏 %d 本）" % (LETTER, ok, fixed))
+
+    total = build_readme()
+    commit_batch("chore: 生成索引 README（共 %d 本）" % total)
+    print("完成：移出 %d，改名 %d，直链 %d，补漏 %d，共 %.1f MB，索引 %d 本，用时 %.1f 分钟"
+          % (removed, renamed, ok, fixed, total_bytes / 1048576, total, (time.time() - t0) / 60), flush=True)
 
 
 if __name__ == "__main__":
