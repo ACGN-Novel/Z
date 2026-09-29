@@ -1,8 +1,8 @@
 # -*- coding: utf-8 -*-
-"""按书名首拼抓取 transchinese 三站 TXT 到本仓库（只抓 txt，不抓 epub）
-- 跳过已存在且非空的文件，断点续传
-- 直链 404 时回退：解析详情页取出真实 .txt 链接补漏
-- 分批 git commit/push
+"""按书名首拼抓取 transchinese 三站 TXT（只抓 txt，不抓 epub）
+- 首拼采用「词组上下文注音」消歧多音字（重生=chong→C，长安=chang→C）
+- 自动迁移：把因首拼变化而放错仓库的书删除，由对应字母仓库重新收录
+- 跳过已存在且非空的文件，断点续传；直链 404 时回退详情页解析真实链接
 """
 import os, re, sys, time, subprocess, urllib.request, urllib.parse
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -14,6 +14,7 @@ WORKERS = int(os.environ.get("WORKERS", "8"))
 MIN_BYTES = int(os.environ.get("MIN_BYTES", "2048"))
 MAX_BYTES = int(float(os.environ.get("MAX_MB", "90")) * 1024 * 1024)
 COMMIT_EVERY = int(os.environ.get("COMMIT_EVERY", "150"))
+SKIP_DIRS = {".git", ".github", "scripts"}
 
 UA = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0 Safari/537.36"}
 SITE_DIR = {
@@ -45,7 +46,9 @@ def initial_of(title):
         return "#"
     ch = s[0]
     if "\u4e00" <= ch <= "\u9fff":
-        py = lazy_pinyin(ch, style=Style.FIRST_LETTER)
+        m = re.match(r"^[\u4e00-\u9fff]+", s)
+        ctx = (m.group() if m else ch)[:8]   # 用词组上下文消歧多音字
+        py = lazy_pinyin(ctx, style=Style.FIRST_LETTER)
         return (py[0].upper() if py and py[0] else "#")
     if ch.isalpha():
         return ch.upper()
@@ -59,13 +62,11 @@ def sanitize(name, maxlen=110):
 
 
 def resolve_from_page(page_url):
-    """详情页里找真实的 .txt 链接"""
     try:
         st, body = http_get(page_url, timeout=120)
         if st != 200:
             return None
-        html = body.decode("utf-8", "ignore")
-        links = re.findall(r'href="([^"]+\.txt)"', html)
+        links = re.findall(r'href="([^"]+\.txt)"', body.decode("utf-8", "ignore"))
         if not links:
             return None
         return urllib.parse.urljoin(page_url, links[0])
@@ -96,10 +97,31 @@ def commit_batch(note):
     return False
 
 
+def migrate_out():
+    """把首拼不再属于本仓库的书移除"""
+    removed = 0
+    for root, dirs, files in os.walk("."):
+        dirs[:] = [d for d in dirs if d not in SKIP_DIRS and not d.startswith(".")]
+        for fn in files:
+            if not fn.lower().endswith(".txt"):
+                continue
+            full = os.path.join(root, fn)
+            if initial_of(fn[:-4]) != LETTER:
+                git("rm", "-q", "--", full)
+                removed += 1
+    if removed:
+        commit_batch(f"chore: 迁移首拼变化的书目（移出 {removed} 本）")
+    return removed
+
+
 def main():
     if not LETTER:
         print("未设置 LETTER"); sys.exit(1)
     print(f"===== 抓取首拼 [{LETTER}] =====", flush=True)
+
+    removed = migrate_out()
+    if removed:
+        print(f"已移出首拼不属于 [{LETTER}] 的书 {removed} 本", flush=True)
 
     books = []
     for base in SITES:
@@ -154,7 +176,6 @@ def main():
             except Exception:
                 pass
             time.sleep(2 * (attempt + 1))
-        # 回退：从详情页解析真实链接
         real = resolve_from_page(page)
         if real:
             try:
@@ -189,7 +210,7 @@ def main():
                 print(f"  进度 {n}/{len(todo)}，已入库 {ok+fixed} 本，{total_bytes/1048576:.0f} MB", flush=True)
 
     commit_batch(f"chore: 同步首拼 {LETTER} 小说（直链 {ok} 本 + 补漏 {fixed} 本）")
-    print(f"\n完成：直链入库 {ok} 本，详情页补漏 {fixed} 本，共 {total_bytes/1048576:.1f} MB，用时 {(time.time()-t0)/60:.1f} 分钟", flush=True)
+    print(f"\n完成：移出 {removed} 本，直链入库 {ok} 本，补漏 {fixed} 本，共 {total_bytes/1048576:.1f} MB，用时 {(time.time()-t0)/60:.1f} 分钟", flush=True)
 
 
 if __name__ == "__main__":
